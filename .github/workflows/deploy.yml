@@ -58,23 +58,25 @@ jobs:
             --from-literal=username=$(echo $CREDS | jq -r .username) \
             --from-literal=password=$(echo $CREDS | jq -r .password)
 
-      - name: Set image and SQS URL in manifests
+      - name: Create/Update ConfigMap
         run: |
-          SQS_URL=$(aws sqs get-queue-url \
-            --queue-name hack-fiap233-video-processor \
-            --region $AWS_REGION \
-            --query QueueUrl --output text | tr -d '\n')
+          SQS_URL="https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/hack-fiap233-video-processor"
 
-          ECR_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
+          kubectl delete configmap processor-config --ignore-not-found
+          kubectl create configmap processor-config \
+            --from-literal=sqs_queue_url="$SQS_URL" \
+            --from-literal=s3_bucket="hack-fiap233-videos-storage"
 
-          sed -i "s|ECR_PROCESSOR_URL:latest|$ECR_IMAGE|" k8s/deployment.yaml
-          sed -i "s|SQS_QUEUE_URL_PLACEHOLDER|$SQS_URL|" k8s/deployment.yaml
-          sed -i "s|S3_BUCKET_PLACEHOLDER|hack-fiap233-videos-storage|" k8s/deployment.yaml
-          sed -i "s|SMTP_FROM_PLACEHOLDER|${{ secrets.SMTP_FROM }}|" k8s/deployment.yaml
-          sed -i "s|SMTP_PASSWORD_PLACEHOLDER|${{ secrets.SMTP_PASSWORD }}|" k8s/deployment.yaml
+      - name: Create/Update SMTP secret
+        run: |
+          kubectl delete secret smtp-credentials --ignore-not-found
+          kubectl create secret generic smtp-credentials \
+            --from-literal=from="${{ secrets.SMTP_FROM }}" \
+            --from-literal=password="${{ secrets.SMTP_PASSWORD }}"
 
       - name: Deploy to EKS
         run: |
           kubectl apply -f k8s/
-          kubectl rollout restart deployment/processor-deployment
+          kubectl set image deployment/processor-deployment \
+            processor=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
           kubectl rollout status deployment/processor-deployment --timeout=120s

@@ -16,20 +16,32 @@ spec:
     spec:
       containers:
         - name: processor
-          image: ECR_PROCESSOR_URL:latest
+          image: placeholder
           ports:
             - containerPort: 8080
           env:
             - name: AWS_REGION
               value: "us-east-1"
             - name: SQS_QUEUE_URL
-              value: "SQS_QUEUE_URL_PLACEHOLDER"
+              valueFrom:
+                configMapKeyRef:
+                  name: processor-config
+                  key: sqs_queue_url
             - name: S3_BUCKET
-              value: "S3_BUCKET_PLACEHOLDER"
+              valueFrom:
+                configMapKeyRef:
+                  name: processor-config
+                  key: s3_bucket
             - name: SMTP_FROM
-              value: "SMTP_FROM_PLACEHOLDER"
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: from
             - name: SMTP_PASSWORD
-              value: "SMTP_PASSWORD_PLACEHOLDER"
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: password
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:
