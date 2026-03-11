@@ -20,6 +20,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -30,6 +33,25 @@ var (
 	s3Bucket  string
 	smtpFrom  string
 	smtpPass  string
+)
+
+var (
+	videosProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "processor_videos_processed_total",
+		Help: "Total de vídeos processados",
+	}, []string{"status"})
+
+	processingDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "processor_video_processing_duration_seconds",
+		Help:    "Duração do processamento de vídeo em segundos",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	framesExtracted = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "processor_frames_extracted",
+		Help:    "Quantidade de frames extraídos por vídeo",
+		Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
+	})
 )
 
 type SNSEnvelope struct {
@@ -60,6 +82,7 @@ func main() {
 	initAWS()
 
 	go func() {
+		http.Handle("/metrics", promhttp.Handler())
 		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "processor"})
@@ -144,9 +167,13 @@ func processMessage(body *string, receiptHandle *string) error {
 		return fmt.Errorf("failed to update status to processing: %w", err)
 	}
 
+	start := time.Now()
 	zipKey, frameCount, err := processVideo(event)
+	processingDuration.Observe(time.Since(start).Seconds())
+
 	if err != nil {
 		db.Exec("UPDATE videos SET status = 'failed' WHERE id = $1", event.VideoID)
+		videosProcessed.WithLabelValues("failed").Inc()
 		return fmt.Errorf("video processing failed: %w", err)
 	}
 
@@ -157,6 +184,8 @@ func processMessage(body *string, receiptHandle *string) error {
 		return fmt.Errorf("failed to update status to done: %w", err)
 	}
 
+	videosProcessed.WithLabelValues("done").Inc()
+	framesExtracted.Observe(float64(frameCount))
 	log.Printf("Video %d done — %d frames — ZIP at s3://%s/%s", event.VideoID, frameCount, s3Bucket, zipKey)
 
 	sendEmail(event.UserEmail, event.Title, frameCount)
