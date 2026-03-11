@@ -26,6 +26,10 @@ spec:
               value: "SQS_QUEUE_URL_PLACEHOLDER"
             - name: S3_BUCKET
               value: "S3_BUCKET_PLACEHOLDER"
+            - name: SMTP_FROM
+              value: "SMTP_FROM_PLACEHOLDER"
+            - name: SMTP_PASSWORD
+              value: "SMTP_PASSWORD_PLACEHOLDER"
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:

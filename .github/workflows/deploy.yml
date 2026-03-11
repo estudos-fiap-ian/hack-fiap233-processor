@@ -70,6 +70,8 @@ jobs:
           sed -i "s|ECR_PROCESSOR_URL:latest|$ECR_IMAGE|" k8s/deployment.yaml
           sed -i "s|SQS_QUEUE_URL_PLACEHOLDER|$SQS_URL|" k8s/deployment.yaml
           sed -i "s|S3_BUCKET_PLACEHOLDER|hack-fiap233-videos-storage|" k8s/deployment.yaml
+          sed -i "s|SMTP_FROM_PLACEHOLDER|${{ secrets.SMTP_FROM }}|" k8s/deployment.yaml
+          sed -i "s|SMTP_PASSWORD_PLACEHOLDER|${{ secrets.SMTP_PASSWORD }}|" k8s/deployment.yaml
 
       - name: Deploy to EKS
         run: |

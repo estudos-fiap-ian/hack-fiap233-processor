@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,8 @@ var (
 	s3Client  *s3.Client
 	queueURL  string
 	s3Bucket  string
+	smtpFrom  string
+	smtpPass  string
 )
 
 type SNSEnvelope struct {
@@ -35,9 +38,10 @@ type SNSEnvelope struct {
 }
 
 type VideoEvent struct {
-	VideoID int    `json:"video_id"`
-	S3Key   string `json:"s3_key"`
-	Title   string `json:"title"`
+	VideoID   int    `json:"video_id"`
+	S3Key     string `json:"s3_key"`
+	Title     string `json:"title"`
+	UserEmail string `json:"user_email"`
 }
 
 func main() {
@@ -49,11 +53,12 @@ func main() {
 	if s3Bucket == "" {
 		log.Fatal("S3_BUCKET is required")
 	}
+	smtpFrom = os.Getenv("SMTP_FROM")
+	smtpPass = os.Getenv("SMTP_PASSWORD")
 
 	initDB()
 	initAWS()
 
-	// Health endpoint for Kubernetes probes
 	go func() {
 		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -139,7 +144,7 @@ func processMessage(body *string, receiptHandle *string) error {
 		return fmt.Errorf("failed to update status to processing: %w", err)
 	}
 
-	zipKey, err := processVideo(event)
+	zipKey, frameCount, err := processVideo(event)
 	if err != nil {
 		db.Exec("UPDATE videos SET status = 'failed' WHERE id = $1", event.VideoID)
 		return fmt.Errorf("video processing failed: %w", err)
@@ -152,7 +157,9 @@ func processMessage(body *string, receiptHandle *string) error {
 		return fmt.Errorf("failed to update status to done: %w", err)
 	}
 
-	log.Printf("Video %d done — ZIP at s3://%s/%s", event.VideoID, s3Bucket, zipKey)
+	log.Printf("Video %d done — %d frames — ZIP at s3://%s/%s", event.VideoID, frameCount, s3Bucket, zipKey)
+
+	sendEmail(event.UserEmail, event.Title, frameCount)
 
 	if _, err := sqsClient.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(queueURL),
@@ -164,48 +171,73 @@ func processMessage(body *string, receiptHandle *string) error {
 	return nil
 }
 
-func processVideo(event VideoEvent) (string, error) {
+func processVideo(event VideoEvent) (zipKey string, frameCount int, err error) {
 	workDir, err := os.MkdirTemp("", fmt.Sprintf("video-%d-*", event.VideoID))
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp dir: %w", err)
+		return "", 0, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 	defer os.RemoveAll(workDir)
 
-	// Download video from S3
 	videoPath := filepath.Join(workDir, "input.mp4")
 	if err := downloadFromS3(event.S3Key, videoPath); err != nil {
-		return "", fmt.Errorf("failed to download from S3: %w", err)
+		return "", 0, fmt.Errorf("failed to download from S3: %w", err)
 	}
 
-	// Extract 1 frame per second with ffmpeg
 	framesDir := filepath.Join(workDir, "frames")
 	os.MkdirAll(framesDir, 0755)
 
 	framePattern := filepath.Join(framesDir, "frame_%04d.png")
 	cmd := exec.Command("ffmpeg", "-i", videoPath, "-vf", "fps=1", "-y", framePattern)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("ffmpeg error: %s: %w", string(output), err)
+		return "", 0, fmt.Errorf("ffmpeg error: %s: %w", string(output), err)
 	}
 
 	frames, err := filepath.Glob(filepath.Join(framesDir, "*.png"))
 	if err != nil || len(frames) == 0 {
-		return "", fmt.Errorf("no frames extracted")
+		return "", 0, fmt.Errorf("no frames extracted")
 	}
 	log.Printf("Extracted %d frames from video %d", len(frames), event.VideoID)
 
-	// Create ZIP with all frames
 	zipPath := filepath.Join(workDir, "frames.zip")
 	if err := createZip(frames, zipPath); err != nil {
-		return "", fmt.Errorf("failed to create ZIP: %w", err)
+		return "", 0, fmt.Errorf("failed to create ZIP: %w", err)
 	}
 
-	// Upload ZIP to S3
-	zipKey := fmt.Sprintf("frames/%d/frames.zip", event.VideoID)
+	zipKey = fmt.Sprintf("frames/%d/frames.zip", event.VideoID)
 	if err := uploadToS3(zipPath, zipKey); err != nil {
-		return "", fmt.Errorf("failed to upload ZIP to S3: %w", err)
+		return "", 0, fmt.Errorf("failed to upload ZIP to S3: %w", err)
 	}
 
-	return zipKey, nil
+	return zipKey, len(frames), nil
+}
+
+func sendEmail(toEmail, videoTitle string, frameCount int) {
+	if toEmail == "" || smtpFrom == "" || smtpPass == "" {
+		log.Println("Skipping email: SMTP_FROM, SMTP_PASSWORD or user email not set")
+		return
+	}
+
+	subject := "Seu vídeo foi processado!"
+	body := fmt.Sprintf(
+		"Olá!\n\nSeu vídeo \"%s\" foi processado com sucesso.\n%d frames foram extraídos e estão disponíveis para download.\n\nFIAP X",
+		videoTitle, frameCount,
+	)
+
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s",
+		smtpFrom, toEmail, subject, body)
+
+	err := smtp.SendMail(
+		"smtp.gmail.com:587",
+		smtp.PlainAuth("", smtpFrom, smtpPass, "smtp.gmail.com"),
+		smtpFrom,
+		[]string{toEmail},
+		[]byte(msg),
+	)
+	if err != nil {
+		log.Printf("Failed to send email to %s: %v", toEmail, err)
+		return
+	}
+	log.Printf("Email sent to %s", toEmail)
 }
 
 func downloadFromS3(s3Key, destPath string) error {
