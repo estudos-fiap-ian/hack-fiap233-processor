@@ -63,7 +63,7 @@ jobs:
           SQS_URL=$(aws sqs get-queue-url \
             --queue-name hack-fiap233-video-processor \
             --region $AWS_REGION \
-            --query QueueUrl --output text)
+            --query QueueUrl --output text | tr -d '\n')
 
           ECR_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
 
