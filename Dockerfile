@@ -4,7 +4,7 @@ COPY . .
 RUN go mod tidy && CGO_ENABLED=0 go build -o /processor .
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates ffmpeg
 COPY --from=builder /processor /processor
 EXPOSE 8080
 CMD ["/processor"]

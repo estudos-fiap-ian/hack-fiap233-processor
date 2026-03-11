@@ -24,6 +24,8 @@ spec:
               value: "us-east-1"
             - name: SQS_QUEUE_URL
               value: "SQS_QUEUE_URL_PLACEHOLDER"
+            - name: S3_BUCKET
+              value: "S3_BUCKET_PLACEHOLDER"
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:
