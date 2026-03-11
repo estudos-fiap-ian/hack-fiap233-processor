@@ -1,0 +1,9 @@
+module github.com/hack-fiap233/processor
+
+go 1.22
+
+require (
+	github.com/aws/aws-sdk-go-v2/config v1.27.0
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.31.0
+	github.com/lib/pq v1.10.9
+)
