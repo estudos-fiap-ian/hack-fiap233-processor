@@ -51,3 +51,32 @@ func (n *Notifier) Notify(_ context.Context, toEmail, videoTitle string, frameCo
 	log.Printf("Email sent to %s", toEmail)
 	return nil
 }
+
+func (n *Notifier) NotifyError(_ context.Context, toEmail, videoTitle string) error {
+	if toEmail == "" || n.from == "" || n.password == "" {
+		log.Println("Skipping error email: SMTP_FROM, SMTP_PASSWORD or user email not set")
+		return nil
+	}
+
+	subject := "Erro ao processar seu vídeo"
+	body := fmt.Sprintf(
+		"Olá!\n\nInfelizmente seu vídeo \"%s\" não pôde ser processado.\nPor favor, entre em contato com o suporte.\n\nFIAP X",
+		videoTitle,
+	)
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s",
+		n.from, toEmail, subject, body)
+
+	err := n.send(
+		"smtp.gmail.com:587",
+		netsmtp.PlainAuth("", n.from, n.password, "smtp.gmail.com"),
+		n.from,
+		[]string{toEmail},
+		[]byte(msg),
+	)
+	if err != nil {
+		log.Printf("Failed to send error email to %s: %v", toEmail, err)
+		return err
+	}
+	log.Printf("Error email sent to %s", toEmail)
+	return nil
+}

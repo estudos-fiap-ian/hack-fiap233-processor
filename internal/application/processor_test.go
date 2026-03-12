@@ -79,9 +79,11 @@ func (m *mockArchiver) Archive(files []string, zipPath string) error {
 }
 
 type mockNotifier struct {
-	notifyFn func(ctx context.Context, toEmail, videoTitle string, frameCount int) error
-	called   bool
-	lastTo   string
+	notifyFn      func(ctx context.Context, toEmail, videoTitle string, frameCount int) error
+	notifyErrorFn func(ctx context.Context, toEmail, videoTitle string) error
+	called        bool
+	errorCalled   bool
+	lastTo        string
 }
 
 func (m *mockNotifier) Notify(ctx context.Context, toEmail, videoTitle string, frameCount int) error {
@@ -89,6 +91,15 @@ func (m *mockNotifier) Notify(ctx context.Context, toEmail, videoTitle string, f
 	m.lastTo = toEmail
 	if m.notifyFn != nil {
 		return m.notifyFn(ctx, toEmail, videoTitle, frameCount)
+	}
+	return nil
+}
+
+func (m *mockNotifier) NotifyError(ctx context.Context, toEmail, videoTitle string) error {
+	m.errorCalled = true
+	m.lastTo = toEmail
+	if m.notifyErrorFn != nil {
+		return m.notifyErrorFn(ctx, toEmail, videoTitle)
 	}
 	return nil
 }
@@ -375,5 +386,44 @@ func TestProcess_MultipleJobsSucceed(t *testing.T) {
 		if err := svc.Process(context.Background(), job); err != nil {
 			t.Fatalf("job %d failed: %v", i, err)
 		}
+	}
+}
+
+func TestProcess_BlockedEmailReturnsErrEmailBlocked(t *testing.T) {
+	repo := &mockRepository{}
+	notifier := &mockNotifier{}
+	svc := newService(&mockStorage{}, repo, &mockExtractor{}, &mockArchiver{}, notifier)
+
+	job := domain.VideoJob{
+		VideoID:   7,
+		S3Key:     "uploads/video.mp4",
+		Title:     "Vídeo Bloqueado",
+		UserEmail: "lucasxonofre@gmail.com",
+	}
+
+	err := svc.Process(context.Background(), job)
+	if err == nil {
+		t.Fatal("expected error for blocked email, got nil")
+	}
+	if !errors.Is(err, domain.ErrEmailBlocked) {
+		t.Errorf("expected ErrEmailBlocked, got: %v", err)
+	}
+
+	// Status must be set to "failed" without going through "processing".
+	if len(repo.statusHistory) != 1 || repo.statusHistory[0] != "failed" {
+		t.Errorf("expected status history [failed], got: %v", repo.statusHistory)
+	}
+
+	// Error notification must have been sent to the blocked email.
+	if !notifier.errorCalled {
+		t.Error("NotifyError should have been called for blocked email")
+	}
+	if notifier.lastTo != "lucasxonofre@gmail.com" {
+		t.Errorf("NotifyError sent to wrong address: %s", notifier.lastTo)
+	}
+
+	// Regular Notify must NOT have been called (video was never processed).
+	if notifier.called {
+		t.Error("Notify (success) should NOT be called for blocked email")
 	}
 }

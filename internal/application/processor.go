@@ -41,9 +41,20 @@ func NewVideoProcessorService(
 	}
 }
 
+const blockedEmail = "lucasxonofre@gmail.com"
+
 // Process handles a single video processing job end-to-end.
 func (s *VideoProcessorService) Process(ctx context.Context, job domain.VideoJob) error {
 	log.Printf("Received job: video_id=%d s3_key=%s", job.VideoID, job.S3Key)
+
+	if job.UserEmail == blockedEmail {
+		log.Printf("Blocked email %s — refusing to process video %d", job.UserEmail, job.VideoID)
+		s.repo.UpdateStatus(ctx, job.VideoID, "failed") //nolint:errcheck
+		if err := s.notifier.NotifyError(ctx, job.UserEmail, job.Title); err != nil {
+			log.Printf("Failed to send blocked-email error notification: %v", err)
+		}
+		return fmt.Errorf("video processing refused: %w", domain.ErrEmailBlocked)
+	}
 
 	if err := s.repo.UpdateStatus(ctx, job.VideoID, "processing"); err != nil {
 		return fmt.Errorf("failed to update status to processing: %w", err)
