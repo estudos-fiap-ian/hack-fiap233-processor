@@ -1,351 +1,59 @@
 package main
 
 import (
-	"archive/zip"
 	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"net/smtp"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	_ "github.com/lib/pq"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+
+	"github.com/hack-fiap233/processor/config"
+	"github.com/hack-fiap233/processor/internal/adapters/ffmpeg"
+	httpadapter "github.com/hack-fiap233/processor/internal/adapters/http"
+	"github.com/hack-fiap233/processor/internal/adapters/postgres"
+	s3adapter "github.com/hack-fiap233/processor/internal/adapters/s3"
+	smtpadapter "github.com/hack-fiap233/processor/internal/adapters/smtp"
+	sqsadapter "github.com/hack-fiap233/processor/internal/adapters/sqs"
+	zipadapter "github.com/hack-fiap233/processor/internal/adapters/zip"
+	"github.com/hack-fiap233/processor/internal/application"
 )
-
-var (
-	db        *sql.DB
-	sqsClient *sqs.Client
-	s3Client  *s3.Client
-	queueURL  string
-	s3Bucket  string
-	smtpFrom  string
-	smtpPass  string
-)
-
-var (
-	videosProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "processor_videos_processed_total",
-		Help: "Total de vídeos processados",
-	}, []string{"status"})
-
-	processingDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "processor_video_processing_duration_seconds",
-		Help:    "Duração do processamento de vídeo em segundos",
-		Buckets: prometheus.DefBuckets,
-	})
-
-	framesExtracted = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "processor_frames_extracted",
-		Help:    "Quantidade de frames extraídos por vídeo",
-		Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
-	})
-)
-
-type SNSEnvelope struct {
-	Type    string `json:"Type"`
-	Message string `json:"Message"`
-}
-
-type VideoEvent struct {
-	VideoID   int    `json:"video_id"`
-	S3Key     string `json:"s3_key"`
-	Title     string `json:"title"`
-	UserEmail string `json:"user_email"`
-}
 
 func main() {
-	queueURL = os.Getenv("SQS_QUEUE_URL")
-	if queueURL == "" {
-		log.Fatal("SQS_QUEUE_URL is required")
-	}
-	s3Bucket = os.Getenv("S3_BUCKET")
-	if s3Bucket == "" {
-		log.Fatal("S3_BUCKET is required")
-	}
-	smtpFrom = os.Getenv("SMTP_FROM")
-	smtpPass = os.Getenv("SMTP_PASSWORD")
-
-	initDB()
-	initAWS()
-
-	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "processor"})
-		})
-		log.Fatal(http.ListenAndServe(":8080", nil))
-	}()
-
-	log.Println("Processor started, polling SQS...")
-	poll()
-}
-
-func initAWS() {
-	cfg, err := config.LoadDefaultConfig(context.Background())
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load AWS config: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
-	sqsClient = sqs.NewFromConfig(cfg)
-	s3Client = s3.NewFromConfig(cfg)
-}
 
-func initDB() {
-	connStr := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
-		os.Getenv("DB_HOST"),
-		os.Getenv("DB_PORT"),
-		os.Getenv("DB_USERNAME"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_NAME"),
-	)
-
-	var err error
-	db, err = sql.Open("postgres", connStr)
+	// ── Database ──────────────────────────────────────────────────────────────
+	db, err := postgres.Connect(cfg.DB.DSN())
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	if err = db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
-
-	if _, err = db.Exec(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS zip_s3_key TEXT`); err != nil {
+	if err := postgres.Migrate(db); err != nil {
 		log.Fatalf("Failed to run migration: %v", err)
 	}
-
 	log.Println("Connected to PostgreSQL")
-}
 
-func poll() {
-	for {
-		output, err := sqsClient.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
-			QueueUrl:            aws.String(queueURL),
-			MaxNumberOfMessages: 10,
-			WaitTimeSeconds:     20,
-		})
-		if err != nil {
-			log.Printf("Error receiving messages: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		for _, msg := range output.Messages {
-			if err := processMessage(msg.Body, msg.ReceiptHandle); err != nil {
-				log.Printf("Error processing message: %v", err)
-			}
-		}
-	}
-}
-
-func processMessage(body *string, receiptHandle *string) error {
-	var envelope SNSEnvelope
-	if err := json.Unmarshal([]byte(*body), &envelope); err != nil {
-		return fmt.Errorf("failed to parse SNS envelope: %w", err)
-	}
-
-	var event VideoEvent
-	if err := json.Unmarshal([]byte(envelope.Message), &event); err != nil {
-		return fmt.Errorf("failed to parse VideoEvent: %w", err)
-	}
-
-	log.Printf("Received job: video_id=%d s3_key=%s", event.VideoID, event.S3Key)
-
-	if _, err := db.Exec("UPDATE videos SET status = 'processing' WHERE id = $1", event.VideoID); err != nil {
-		return fmt.Errorf("failed to update status to processing: %w", err)
-	}
-
-	start := time.Now()
-	zipKey, frameCount, err := processVideo(event)
-	processingDuration.Observe(time.Since(start).Seconds())
-
+	// ── AWS ───────────────────────────────────────────────────────────────────
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
 	if err != nil {
-		db.Exec("UPDATE videos SET status = 'failed' WHERE id = $1", event.VideoID)
-		videosProcessed.WithLabelValues("failed").Inc()
-		return fmt.Errorf("video processing failed: %w", err)
+		log.Fatalf("Failed to load AWS config: %v", err)
 	}
 
-	if _, err := db.Exec(
-		"UPDATE videos SET status = 'done', zip_s3_key = $1 WHERE id = $2",
-		zipKey, event.VideoID,
-	); err != nil {
-		return fmt.Errorf("failed to update status to done: %w", err)
-	}
+	// ── Adapters (secondary / outbound) ───────────────────────────────────────
+	storage := s3adapter.New(awss3.NewFromConfig(awsCfg), cfg.S3Bucket)
+	repo := postgres.NewVideoRepository(db)
+	extractor := ffmpeg.New()
+	archiver := zipadapter.New()
+	notifier := smtpadapter.New(cfg.SMTPFrom, cfg.SMTPPassword)
 
-	videosProcessed.WithLabelValues("done").Inc()
-	framesExtracted.Observe(float64(frameCount))
-	log.Printf("Video %d done — %d frames — ZIP at s3://%s/%s", event.VideoID, frameCount, s3Bucket, zipKey)
+	// ── Application service ───────────────────────────────────────────────────
+	processor := application.NewVideoProcessorService(storage, repo, extractor, archiver, notifier, cfg.S3Bucket)
 
-	sendEmail(event.UserEmail, event.Title, frameCount)
+	// ── HTTP server (metrics + health) ────────────────────────────────────────
+	go httpadapter.New(":8080").Start()
 
-	if _, err := sqsClient.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
-		QueueUrl:      aws.String(queueURL),
-		ReceiptHandle: receiptHandle,
-	}); err != nil {
-		log.Printf("Warning: failed to delete SQS message: %v", err)
-	}
-
-	return nil
-}
-
-func processVideo(event VideoEvent) (zipKey string, frameCount int, err error) {
-	workDir, err := os.MkdirTemp("", fmt.Sprintf("video-%d-*", event.VideoID))
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(workDir)
-
-	videoPath := filepath.Join(workDir, "input.mp4")
-	if err := downloadFromS3(event.S3Key, videoPath); err != nil {
-		return "", 0, fmt.Errorf("failed to download from S3: %w", err)
-	}
-
-	framesDir := filepath.Join(workDir, "frames")
-	os.MkdirAll(framesDir, 0755)
-
-	framePattern := filepath.Join(framesDir, "frame_%04d.png")
-	cmd := exec.Command("ffmpeg", "-i", videoPath, "-vf", "fps=1", "-y", framePattern)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", 0, fmt.Errorf("ffmpeg error: %s: %w", string(output), err)
-	}
-
-	frames, err := filepath.Glob(filepath.Join(framesDir, "*.png"))
-	if err != nil || len(frames) == 0 {
-		return "", 0, fmt.Errorf("no frames extracted")
-	}
-	log.Printf("Extracted %d frames from video %d", len(frames), event.VideoID)
-
-	zipPath := filepath.Join(workDir, "frames.zip")
-	if err := createZip(frames, zipPath); err != nil {
-		return "", 0, fmt.Errorf("failed to create ZIP: %w", err)
-	}
-
-	zipKey = fmt.Sprintf("frames/%d/frames.zip", event.VideoID)
-	if err := uploadToS3(zipPath, zipKey); err != nil {
-		return "", 0, fmt.Errorf("failed to upload ZIP to S3: %w", err)
-	}
-
-	return zipKey, len(frames), nil
-}
-
-func sendEmail(toEmail, videoTitle string, frameCount int) {
-	if toEmail == "" || smtpFrom == "" || smtpPass == "" {
-		log.Println("Skipping email: SMTP_FROM, SMTP_PASSWORD or user email not set")
-		return
-	}
-
-	subject := "Seu vídeo foi processado!"
-	body := fmt.Sprintf(
-		"Olá!\n\nSeu vídeo \"%s\" foi processado com sucesso.\n%d frames foram extraídos e estão disponíveis para download.\n\nFIAP X",
-		videoTitle, frameCount,
-	)
-
-	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s",
-		smtpFrom, toEmail, subject, body)
-
-	err := smtp.SendMail(
-		"smtp.gmail.com:587",
-		smtp.PlainAuth("", smtpFrom, smtpPass, "smtp.gmail.com"),
-		smtpFrom,
-		[]string{toEmail},
-		[]byte(msg),
-	)
-	if err != nil {
-		log.Printf("Failed to send email to %s: %v", toEmail, err)
-		return
-	}
-	log.Printf("Email sent to %s", toEmail)
-}
-
-func downloadFromS3(s3Key, destPath string) error {
-	result, err := s3Client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(s3Bucket),
-		Key:    aws.String(s3Key),
-	})
-	if err != nil {
-		return err
-	}
-	defer result.Body.Close()
-
-	f, err := os.Create(destPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = io.Copy(f, result.Body)
-	return err
-}
-
-func uploadToS3(filePath, s3Key string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = s3Client.PutObject(context.Background(), &s3.PutObjectInput{
-		Bucket: aws.String(s3Bucket),
-		Key:    aws.String(s3Key),
-		Body:   f,
-	})
-	return err
-}
-
-func createZip(files []string, zipPath string) error {
-	zipFile, err := os.Create(zipPath)
-	if err != nil {
-		return err
-	}
-	defer zipFile.Close()
-
-	w := zip.NewWriter(zipFile)
-	defer w.Close()
-
-	for _, file := range files {
-		if err := addToZip(w, file); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func addToZip(w *zip.Writer, filePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-	header.Name = filepath.Base(filePath)
-	header.Method = zip.Deflate
-
-	writer, err := w.CreateHeader(header)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(writer, f)
-	return err
+	// ── SQS consumer (primary / inbound) — blocks forever ────────────────────
+	sqsadapter.New(awssqs.NewFromConfig(awsCfg), cfg.SQSQueueURL, processor).Start(context.Background())
 }
