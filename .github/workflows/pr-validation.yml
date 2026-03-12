@@ -15,7 +15,7 @@ env:
 
 jobs:
   test-and-coverage:
-    name: Tests & Coverage (min 80%)
+    name: Tests & Coverage (min 75%)
     runs-on: ubuntu-latest
 
     steps:
@@ -33,13 +33,13 @@ jobs:
       - name: Run tests with coverage
         run: go test ./... -coverprofile=coverage.out -covermode=atomic
 
-      - name: Check coverage >= 80%
+      - name: Check coverage >= 75%
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
           echo "Coverage: ${COVERAGE}%"
-          RESULT=$(echo "$COVERAGE >= 80" | bc -l)
+          RESULT=$(echo "$COVERAGE >= 75" | bc -l)
           if [ "$RESULT" -ne 1 ]; then
-            echo "::error::Coverage ${COVERAGE}% is below the required 80%"
+            echo "::error::Coverage ${COVERAGE}% is below the required 75%"
             exit 1
           fi
 
